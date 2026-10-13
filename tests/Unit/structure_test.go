@@ -112,24 +112,24 @@ func TestThePackageUsesTheGeneratedConcreteModel(t *testing.T) {
 	wants := map[string][]string{
 		"model.go": {
 			`"github.com/arandu-io/hesape/database/model"`,
-			"type Inspect struct {\n\tmodel.Model\n",
-			"var inspectTable = model.NewTable(model.TableSpec{",
+			"type Inspection struct {\n\tmodel.Model\n",
+			"var inspectionTable = model.NewTable(model.TableSpec{",
 			"ManualKey: true,",
 			"// arandu:begin custom\n",
 			"// arandu:end custom\n",
 		},
-		"InspectQuery.go": {
+		"InspectionQuery.go": {
 			generatedHeading,
-			"func Inspects(db model.DB) *InspectQuery",
-			"type InspectCollection []*Inspect",
+			"func Inspections(db model.DB) *InspectionQuery",
+			"type InspectionCollection []*Inspection",
 		},
 		"service.go": {
 			"db     *data.DB",
 			"func NewInspectService(db *data.DB) *InspectService",
-			"Inspects(s.db).New()",
-			"Inspects(s.db).WhereKey(",
-			") (*Inspect, error)",
-			") ([]*Inspect, error)",
+			"Inspections(s.db).New()",
+			"Inspections(s.db).WhereKey(",
+			") (*Inspection, error)",
+			") ([]*Inspection, error)",
 		},
 		"module.go": {
 			"NewInspectService(db)",
@@ -172,8 +172,8 @@ func TestThePackageUsesTheGeneratedConcreteModel(t *testing.T) {
 				t.Errorf("%s still spells the generic model layer %q", filepath.ToSlash(relative), stale)
 			}
 		}
-		if relative != "InspectQuery.go" && strings.Contains(string(body), generatedHeading) {
-			t.Errorf("%s carries the heading of the generated query, which only InspectQuery.go may", filepath.ToSlash(relative))
+		if relative != "InspectionQuery.go" && strings.Contains(string(body), generatedHeading) {
+			t.Errorf("%s carries the heading of the generated query, which only InspectionQuery.go may", filepath.ToSlash(relative))
 		}
 		return nil
 	})
@@ -191,13 +191,13 @@ func TestTheGuidesTeachTheGeneratedModelBoundary(t *testing.T) {
 
 	root := packageRoot(t)
 	guides := map[string][]string{
-		"AGENTS.md":                               {"Inspects(db)", "security.Authorize"},
-		"README.md":                               {"Inspects(db)", "InspectQuery", "aru model:build", "RequireAuth"},
-		"CONTRIBUTING.md":                         {"Inspects(db)", "authorizes before reaching the Model", "aru model:build"},
+		"AGENTS.md":                               {"Inspections(db)", "security.Authorize"},
+		"README.md":                               {"Inspections(db)", "InspectionQuery", "aru model:build", "RequireAuth"},
+		"CONTRIBUTING.md":                         {"Inspections(db)", "authorizes before reaching the Model", "aru model:build"},
 		"SECURITY.md":                             {"Model terminal", "data.Tenant(g)"},
-		".agents/skills/README.md":                {"InspectQuery", "custom block"},
-		".agents/skills/inspect-module/SKILL.md":  {"inspectTable", "ctx.User()", "RequireAuth", "return err"},
-		".agents/skills/inspect-policy/SKILL.md":  {"security.Authorize", "Inspects(s.db).New()"},
+		".agents/skills/README.md":                {"InspectionQuery", "custom block"},
+		".agents/skills/inspect-module/SKILL.md":  {"inspectionTable", "ctx.User()", "RequireAuth", "return err"},
+		".agents/skills/inspect-policy/SKILL.md":  {"security.Authorize", "Inspections(s.db).New()"},
 		".agents/skills/inspect-release/SKILL.md": {"model:build --check", "configured copy"},
 		".agents/skills/inspect-package/SKILL.md": {"RequireAuth", "/auth/login"},
 	}

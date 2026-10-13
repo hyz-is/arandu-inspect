@@ -1,51 +1,38 @@
-// Package inspect is an Arandu module: one entity with its generated query, one
-// policy that decides about it, one service that orchestrates each use case, and
-// the routes that reach them.
+// Package inspect is an Arandu module that takes an operator into somebody's
+// account without signing them out of their own, lets them act there as the
+// account's owner, brings them back, and holds the visit to a deadline.
+// Everything is recorded in arandu-activitylog under the operator's name.
 //
-// The files are laid out by role rather than by layer, so the whole package
-// reads top to bottom:
+//	module.go   -> registration, routes, handlers, the guard and the migration
+//	config.go   -> what the application passes in
+//	model.go    -> the inspection
+//	policy.go   -> who may go into which account
+//	service.go  -> going in, coming back, the deadline, the history
 //
-//	module.go      -> registration, routes, handlers and migrations
-//	config.go      -> what the application passes in
-//	model.go       -> the entity, and what it may answer with
-//	policy.go      -> who may do what
-//	service.go     -> the use cases, and Model access after authorization
-//	views.go       -> the files the application takes ownership of
-//
-// An application registers it explicitly. There is no service provider, no
-// container and no discovery: the wiring is three lines somebody wrote, and
-// reading them is how they learn what the application is made of.
+// The bar that tells the operator whose account they are in is drawn by the
+// application's layout from hesape's view.Inspection, which every page built
+// with view.New answers; its button posts to the route named inspect.leave,
+// which this module registers.
 package inspect
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	stdhttp "net/http"
-	"strings"
+	"strconv"
+	"time"
 
 	"github.com/arandu-io/framework/data"
 	"github.com/arandu-io/framework/foundation"
 	fhttp "github.com/arandu-io/framework/http"
 	"github.com/arandu-io/framework/http/middleware"
 	"github.com/arandu-io/framework/security"
+	"github.com/arandu-io/hesape/auth"
 	"github.com/arandu-io/hesape/database/migrations"
 	"github.com/arandu-io/hesape/database/schema"
-	"github.com/arandu-io/hesape/view"
 )
 
 // Module is what the application registers.
-//
-// It implements foundation.Module, which is Name and Routes and nothing else --
-// that pair is the whole public contract between a package and the framework.
-//
-// It also implements foundation.Migratable, because it owns a table, and
-// foundation.Publishable, because it hands view sources to the project. The
-// other optional interfaces are declared beside Module in the framework and are
-// opted into the same way, by implementing them: Bootable to prepare state at
-// boot, Background to run a loop of its own, Schedulable to declare work for
-// the scheduler, Health to report on the storage it depends on, Closable to
-// give resources back at shutdown.
 type Module struct {
 	cfg      Config
 	svc      *InspectService
@@ -54,242 +41,194 @@ type Module struct {
 
 // Compile-time proof that the module honors the contracts it claims.
 var (
-	_ foundation.Module      = (*Module)(nil)
-	_ foundation.Migratable  = (*Module)(nil)
-	_ foundation.Bootable    = (*Module)(nil)
-	_ foundation.Publishable = (*Module)(nil)
+	_ foundation.Module     = (*Module)(nil)
+	_ foundation.Migratable = (*Module)(nil)
 )
 
 // New returns the module, or the reason it cannot be built.
-//
-// The collaborators are parameters and not fields somebody fills in afterwards:
-// a module that could be registered half-wired is a module whose first request
-// is the thing that reports the missing half.
-//
-// It returns an error rather than panicking or carrying on, because everything
-// it refuses is a wiring mistake, and a wiring mistake found at boot costs one
-// restart. The same mistake found later is a request that reached a nil handle.
 func New(cfg Config, db *data.DB, sessions *security.SessionStore) (*Module, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	if db == nil {
-		return nil, errors.New("inspect: New needs a database handle: this package owns a table, and there is no in-memory mode that would let it start without one")
+		return nil, errors.New("inspect: New needs a database handle: the inspections are kept in a table")
 	}
 	if sessions == nil {
-		return nil, errors.New("inspect: New needs a session store: every route is mounted behind RequireAuth, which reads it to admit a request and to put who is asking on it")
+		return nil, errors.New("inspect: New needs the session store: going into an account and back is a change of the session's subject")
 	}
 	cfg = cfg.withDefaults()
-	return &Module{
-		cfg:      cfg,
-		svc:      NewInspectService(db),
-		sessions: sessions,
-	}, nil
+	svc := NewInspectService(db)
+	svc.targets, svc.activity, svc.ttl, svc.userType = cfg.Targets, cfg.Activity, cfg.TTL, cfg.UserType
+	return &Module{cfg: cfg, svc: svc, sessions: sessions}, nil
 }
 
-// Name is the module identifier: a lowercase slug, stable, no spaces.
-//
-// It is what `aru route:list` groups by and what the route names are prefixed with,
-// so changing it changes addresses that other code has already written down.
+// Service is the use cases, for an application that calls them from its own
+// code. Every method asks the policy.
+func (m *Module) Service() *InspectService { return m.svc }
+
+// Name is the module identifier.
 func (m *Module) Name() string { return "inspect" }
 
-// Routes registers the module's routes under the configured prefix.
+// Routes registers the module's routes, behind RequireAuth.
 //
-// They are named, so a URL is built from a name rather than written out a
-// second time somewhere else -- two spellings of one address disagree, and the
-// failure when they do is a link to a 404.
-//
-// Every route needs somebody signed in, so the guard is mounted once, on the
-// router they are registered on, rather than route by route: r is replaced by
-// the guarded group before the first registration, and no unguarded router is
-// left in scope for the next route to be added to. RequireAuth sends a request
-// with no session to the sign-in screen, and puts the subject of one that has a
-// session on its context, where a handler reads it with ctx.User.
+// inspect.leave is the name hesape's view.New links the way back by, so the
+// bar every page draws posts here without the application spelling the path.
 func (m *Module) Routes(r *fhttp.Router) {
 	r = r.Group("", middleware.RequireAuth(m.sessions))
 
-	r.Action(stdhttp.MethodGet, m.cfg.Prefix, m.index).Name("inspect.index")
-	r.Action(stdhttp.MethodGet, m.cfg.Prefix+"/{id}", m.show).Name("inspect.show")
-	r.Action(stdhttp.MethodPost, m.cfg.Prefix, m.store).Name("inspect.store")
+	r.Action(stdhttp.MethodPost, m.cfg.Prefix+"/users/{id}", m.start).Name("inspect.start")
+	r.Action(stdhttp.MethodPost, m.cfg.Prefix+"/leave", m.leave).Name("inspect.leave")
+	r.Action(stdhttp.MethodGet, m.cfg.Prefix+"/history", m.history).Name("inspect.history")
 }
 
-// PublishCommand is what an application runs to take ownership of the views
-// this package offers.
-//
-// It is spelled out as a constant so that whatever says it -- the refusal
-// below, or a message an application writes for its own operators -- says one
-// thing. A person who is told two different commands for one job tries both.
-//
-// The command reads the modules the application registered and writes what each
-// one declares, which is why it is the application's command and not this
-// package's: nothing outside the application knows which modules it holds.
-const PublishCommand = "aru vendor:publish --apply"
-
-// Boot refuses to serve when a view this package renders is not in the binary.
-//
-// A compiled view registers itself from init(), so by the time anything boots
-// the question has one answer already: either the application published the
-// files, compiled them and imported the package they became, or it did not.
-// Asking here turns "did anybody run the install command" into one refusal at
-// start-up that names the views and the command, instead of a 500 on the first
-// request that reached one of them -- which is where it used to be answered,
-// once per page, to whoever happened to open it.
-//
-// It also holds the destination. Every file the archive offers has to land
-// under the module directory named after this module: an archive that reached
-// resources/views/home.kyse.go would land on a page the application wrote, and
-// what publishes the files writes what the archive says.
-func (m *Module) Boot(context.Context) error {
-	prefix := viewRoot + "/" + moduleDir + "/" + m.Name() + "/"
-	var stray []string
-	for _, path := range PublishedPaths() {
-		if !strings.HasPrefix(path, prefix) {
-			stray = append(stray, path)
-		}
-	}
-	if len(stray) > 0 {
-		return fmt.Errorf("inspect: %s would be published outside %s, where it lands on a file the application wrote",
-			strings.Join(stray, ", "), prefix)
-	}
-
-	registered := make(map[string]bool)
-	for _, name := range view.Registered() {
-		registered[name] = true
-	}
-	var missing []string
-	for _, name := range ViewNames() {
-		if !registered[name] {
-			missing = append(missing, name)
-		}
-	}
-	if len(missing) > 0 {
-		// The compiled packages are named because the import is the half of the
-		// install nothing else can do: the command writes the sources, the view
-		// compiler turns them into Go, and a package the application does not
-		// import is not linked at all.
-		imports := make([]string, 0, len(ViewPackages()))
-		for _, pkg := range ViewPackages() {
-			imports = append(imports, "<module path>/"+pkg)
-		}
-		return fmt.Errorf("inspect: no view is registered as %s. Run `%s`, then `aru view:build`, then import %s in bootstrap/app.go",
-			strings.Join(missing, ", "), PublishCommand, strings.Join(imports, ", "))
-	}
-	return nil
-}
-
-// Handlers are thin on purpose: read the input, ask the service, answer. No
-// rule, database handle or Model construction lives here. A handler that
-// reached data directly would skip the service's policy boundary, and the
-// layout makes that visible rather than relying on review.
-//
-// Who is asking comes from ctx.User, which reads the subject RequireAuth put on
-// the request. No handler loads the session again or takes an identity from the
-// input. The second value ctx.User answers is not consulted: behind the guard
-// there is always a subject, and were there none, the zero subject it answers
-// would be refused by security.Authorize before any policy ran.
-//
-// An error from the service is returned as it is, and the router answers it:
-// validation.Errors goes back where the request came from with the messages in
-// the flash, ErrNotFound is 404 because it wraps model.ErrModelNotFound, and a
-// policy refusal is 403. The answer is the status and its standard sentence,
-// never the error's own text -- telling a client why a policy said no tells it
-// what exists, one request at a time, and the reason belongs in the log. Any
-// other error is one nobody expected, and it reaches the error page rather than
-// a 200 with an empty body.
-
-// index answers a page of records.
-func (m *Module) index(ctx *fhttp.Context) error {
-	query := data.Query{
-		Sort:   ctx.Query("sort"),
-		Cursor: ctx.Query("cursor"),
-		Limit:  m.cfg.PageSize,
-	}
-
+// start takes the operator into the account named in the path, and lands them
+// inside it.
+func (m *Module) start(ctx *fhttp.Context) error {
 	who, _ := ctx.User()
-	records, err := m.svc.List(ctx.Ctx(), who, query)
+	acting, record, err := m.svc.Start(ctx.Ctx(), who, ctx.Param("id"))
 	if err != nil {
 		return err
 	}
-
-	// A full page is the only one that can have a successor. A short page is
-	// the last one, and offering a cursor for it would be offering a next page
-	// that comes back empty.
-	cursor := ""
-	if len(records) == m.cfg.PageSize {
-		cursor = records[len(records)-1].ID
+	if _, err := m.sessions.Rotate(ctx.Ctx(), ctx.Response, m.sessions.IDFromRequest(ctx.Request), acting); err != nil {
+		return err
 	}
-	return ctx.JSON(stdhttp.StatusOK, collectionFromPointers(records, cursor))
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusCreated, inspectionResource{record})
+	}
+	return ctx.Redirect(m.cfg.Landing)
 }
 
-// show answers one record.
-func (m *Module) show(ctx *fhttp.Context) error {
+// leave takes the operator back to their own account.
+func (m *Module) leave(ctx *fhttp.Context) error {
 	who, _ := ctx.User()
-	record, err := m.svc.Find(ctx.Ctx(), who, ctx.Param("id"))
+	back, record, err := m.svc.Leave(ctx.Ctx(), who, EndLeft)
 	if err != nil {
 		return err
 	}
-	return ctx.JSON(stdhttp.StatusOK, resourceFromPointer(record))
+	if _, err := m.sessions.Rotate(ctx.Ctx(), ctx.Response, m.sessions.IDFromRequest(ctx.Request), back); err != nil {
+		return err
+	}
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusOK, inspectionResource{record})
+	}
+	return ctx.Redirect(m.cfg.Return)
 }
 
-// store creates one record.
-func (m *Module) store(ctx *fhttp.Context) error {
-	in := CreateRequest{Name: ctx.Input("name")}
-
+// history answers a page of inspections, for an operator.
+func (m *Module) history(ctx *fhttp.Context) error {
+	page, _ := strconv.Atoi(ctx.Query("page"))
 	who, _ := ctx.User()
-	record, err := m.svc.Create(ctx.Ctx(), who, in)
+	rows, total, err := m.svc.History(ctx.Ctx(), who, HistoryQuery{
+		ActorID: ctx.Query("actor"), TargetID: ctx.Query("target"), Status: Status(ctx.Query("status")), Page: page,
+	})
 	if err != nil {
 		return err
 	}
-	return ctx.JSON(stdhttp.StatusCreated, resourceFromPointer(record))
+	return ctx.JSON(stdhttp.StatusOK, historyResource{rows: rows, total: total})
 }
+
+// Guard ends an inspection whose deadline passed: the next request of the
+// operator inside the account is taken back to their own, and the end is
+// recorded. The application mounts it after RequireAuth on the routes an
+// operator can reach from inside an account -- its panel, usually:
+//
+//	panel := r.Group("/painel", middleware.RequireAuth(sessions), inspectModule.Guard())
+func (m *Module) Guard() func(stdhttp.Handler) stdhttp.Handler {
+	return func(next stdhttp.Handler) stdhttp.Handler {
+		return stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+			current, ok := auth.SubjectFrom(r.Context())
+			if !ok || current.Impersonator == nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+			lapsed, err := m.svc.Lapsed(r.Context(), current)
+			if err != nil || !lapsed {
+				next.ServeHTTP(w, r)
+				return
+			}
+			back, _, err := m.svc.Leave(r.Context(), current, EndExpired)
+			if err != nil {
+				stdhttp.Error(w, stdhttp.StatusText(stdhttp.StatusForbidden), stdhttp.StatusForbidden)
+				return
+			}
+			if _, err := m.sessions.Rotate(r.Context(), w, m.sessions.IDFromRequest(r), back); err != nil {
+				stdhttp.Error(w, stdhttp.StatusText(stdhttp.StatusInternalServerError), stdhttp.StatusInternalServerError)
+				return
+			}
+			stdhttp.Redirect(w, r, m.cfg.Return, stdhttp.StatusSeeOther)
+		})
+	}
+}
+
+// inspectionResource is one inspection as a response says it.
+type inspectionResource struct{ i *Inspection }
+
+func inspectionFields(i *Inspection) map[string]any {
+	if i == nil {
+		return map[string]any{}
+	}
+	out := map[string]any{
+		"id": i.ID, "actor_id": i.ActorID, "target_id": i.TargetID, "acting": bool(i.Acting),
+		"status": string(i.Status), "started_at": i.StartedAt.UTC().Format(time.RFC3339),
+		"expires_at": i.ExpiresAt.UTC().Format(time.RFC3339),
+	}
+	if i.Status == Closed {
+		out["closed_at"], out["end_reason"] = i.ClosedAt.UTC().Format(time.RFC3339), i.EndReason
+	}
+	return out
+}
+
+func (r inspectionResource) ToArray() map[string]any { return inspectionFields(r.i) }
+func (r inspectionResource) With() map[string]any    { return nil }
+
+type historyResource struct {
+	rows  []*Inspection
+	total int
+}
+
+func (r historyResource) ToArray() map[string]any {
+	items := make([]map[string]any, 0, len(r.rows))
+	for _, i := range r.rows {
+		items = append(items, inspectionFields(i))
+	}
+	return map[string]any{"items": items, "total": r.total}
+}
+func (r historyResource) With() map[string]any { return nil }
 
 // Migrations declares the schema this module owns.
-//
-// They are returned in the order their names sort in, which is the order they
-// apply in: the name carries the order, and nothing else decides it.
 func (m *Module) Migrations() []foundation.Migration {
-	return []foundation.Migration{createInspects{}}
+	return []foundation.Migration{createInspections{}}
 }
 
-// The migration is reversible, and the assertion is here rather than discovered
-// at rollback: the migrator tests for Down with a type assertion, so a Down
-// with the wrong signature would leave a rollback that silently does nothing.
-var _ migrations.ReversibleMigration = createInspects{}
+var _ migrations.ReversibleMigration = createInspections{}
 
-// createInspects is the table this module owns, and the index its listing
-// reads by.
-type createInspects struct{ migrations.BaseMigration }
+// createInspections is the visits operators made to accounts.
+type createInspections struct{ migrations.BaseMigration }
 
-// GetName is the migration's identity, and it carries the order. It is fixed
-// once the package is published: changing what an applied name means leaves the
-// change missing everywhere it already ran, and nothing says so.
-func (createInspects) GetName() string { return "20260823_0001_create_inspects" }
+// GetName is the migration's identity, and it carries the order.
+func (createInspections) GetName() string { return "20261013_0001_create_inspections" }
 
-// Up creates the table and the index the keyset pagination scans.
-//
-// The Blueprint spells each column for the engine the migration is running on,
-// which is what lets one application develop on a file and deploy on Postgres
-// without a second schema. That used to be written out as SQL here, with a
-// comment explaining that an identifier column is VARCHAR rather than TEXT
-// because it takes part in a key and MySQL refuses TEXT in one without a prefix
-// length -- which is the grammar's job, done by hand in every migration that
-// remembered to.
-//
-// The timestamp has no database default: the value comes from Go.
-func (createInspects) Up(ctx context.Context, conn migrations.Connection) error {
-	return conn.Schema().Create(ctx, "inspects", func(table *schema.Blueprint) {
-		table.String("id").Primary()
-		table.String("tenant_id")
-		table.String("name")
+// Up creates the table.
+func (createInspections) Up(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().Create(ctx, inspectionsTable, func(table *schema.Blueprint) {
+		table.String("id", maxIdentifierLen).Primary()
+		table.String("tenant_id", maxIdentifierLen)
+		table.String("actor_id", maxIdentifierLen)
+		table.String("target_id", maxIdentifierLen)
+		table.UnsignedSmallInteger("acting").Default(0)
+		table.String("status", 16)
+		table.Timestamp("started_at")
+		table.Timestamp("expires_at")
+		table.Timestamp("closed_at")
+		table.String("end_reason", 16).Default("")
 		table.Timestamp("created_at")
-
-		// The index matches the ORDER BY of the listing, tenant first. Without
-		// it every page is a scan of every customer's rows.
-		table.Index([]string{"tenant_id", "created_at", "id"}, "inspects_tenant_created_idx")
+		table.Timestamp("updated_at")
+		table.Index([]string{"tenant_id", "actor_id", "target_id", "status"}, "inspections_open_idx")
+		table.Index([]string{"tenant_id", "started_at", "id"}, "inspections_started_idx")
 	})
 }
 
-// Down drops the table, which takes its index with it.
-func (createInspects) Down(ctx context.Context, conn migrations.Connection) error {
-	return conn.Schema().DropIfExists(ctx, "inspects")
+// Down drops the table.
+func (createInspections) Down(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().DropIfExists(ctx, inspectionsTable)
 }

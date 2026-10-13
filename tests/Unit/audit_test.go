@@ -180,7 +180,7 @@ func TestEveryServiceMethodAuthorizesBeforeTheModel(t *testing.T) {
 }
 
 // firstModelReach is where a Service first constructs the generated query or
-// calls a promoted write terminal. Inspects itself counts: moving only its
+// calls a promoted write terminal. Inspections itself counts: moving only its
 // construction before Authorize is the mutation this audit exists to reject.
 func firstModelReach(body *ast.BlockStmt) token.Pos {
 	terminals := map[string]bool{
@@ -193,7 +193,7 @@ func firstModelReach(body *ast.BlockStmt) token.Pos {
 			return true
 		}
 		name := calledName(call)
-		if name != "Inspects" && !terminals[name] {
+		if name != "Inspections" && !terminals[name] {
 			return true
 		}
 		if found == token.NoPos || call.Pos() < found {

@@ -19,7 +19,7 @@ Four things happen, in this order, and each one is a different file.
 2. `service.go` calls `security.Authorize(ctx, s.policy, actor, ACTION, record)`.
 3. `policy.go` `Can` returns nil, or the reason it will not.
 4. Only then does a `security.Grant` exist, and `service.go` reaches
-   `Inspects(s.db)` and a Model terminal with it.
+   `Inspections(s.db)` and a Model terminal with it.
 
 The Grant is the mechanism, and it is worth knowing exactly how much it
 guarantees. `Authorize` is the only function in the framework that returns a
@@ -34,7 +34,7 @@ here reports it either. Do not reach for it in this package.
 
 The Model requires a Grant and applies its tenant, but it does not decide which
 Policy action that Grant represents. `security.Authorize` before the first
-`Inspects(s.db)` call is therefore mandatory even though the terminal itself
+`Inspections(s.db)` call is therefore mandatory even though the terminal itself
 also takes `g`.
 
 ## The procedure
@@ -45,7 +45,7 @@ also takes `g`.
 
 ```go
 	// arandu:begin custom
-	if a == InspectView && (s.ID == record.ID || s.HasRole("admin")) {
+	if a == InspectHistory && (s.ID == record.ID || s.HasRole("admin")) {
 		return nil
 	}
 	// arandu:end custom
@@ -109,19 +109,19 @@ allowed, which is still refused — rather than removing the action from
 ## Adding a Model-backed service method
 
 `InspectService` owns `db *data.DB`. Validate first, build the value the Policy
-must see, call `security.Authorize`, and only then call `Inspects(s.db)`.
+must see, call `security.Authorize`, and only then call `Inspections(s.db)`.
 `TestEveryServiceMethodAuthorizesBeforeTheModel` reads every exported Service
 method and refuses the opposite order; the runtime twin uses a nil database so
 even constructing the query early fails.
 
-Create builds the row with `Inspects(s.db).New()`, keeps its pointer, fills it
+Create builds the row with `Inspections(s.db).New()`, keeps its pointer, fills it
 field by field, writes `TenantID` from `data.Tenant(g)`, and calls
 `Save(ctx, g)`. Find and Get return pointers too. A copy of a row keeps the model
 of the original, and the model refuses to write through it with
 `model.ErrUnwired`; assigning a whole struct over a row from `New()` does the
 same to the row.
 
-Every query starts at `Inspects(s.db)`. The constructor returns one mutable
+Every query starts at `Inspections(s.db)`. The constructor returns one mutable
 query, so a second chain begun from a value held in a variable carries the
 clauses of the first.
 
@@ -151,9 +151,9 @@ customers with a technical name.
 people delete:
 
 ```go
-	g, err := security.Authorize(ctx, s.policy, actor, InspectView, Inspect{})
-	record, err := Inspects(s.db).WhereKey(id).First(ctx, g)
-	_, err = security.Authorize(ctx, s.policy, actor, InspectView, *record)
+	g, err := security.Authorize(ctx, s.policy, actor, InspectHistory, Inspection{})
+	record, err := Inspections(s.db).WhereKey(id).First(ctx, g)
+	_, err = security.Authorize(ctx, s.policy, actor, InspectHistory, *record)
 ```
 
 The first call sees an empty value, so every rule about the record itself —
@@ -168,7 +168,7 @@ A policy call per record would be one call per row of a page and would still not
 narrow the query — a listing that has to read a customer's rows in order to
 decide it may not read them has already read them. **A rule that hides
 individual records from a listing belongs in the query, as a predicate**,
-beside the tenant filter — a scope on `*InspectQuery` when more than one use
+beside the tenant filter — a scope on `*InspectionQuery` when more than one use
 case needs it. The action decides whether the listing runs at all.
 
 ## Three shapes that look like authorization and are not

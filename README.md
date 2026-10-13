@@ -4,230 +4,136 @@
 
 # Arandu Inspect
 
-An Arandu package. It registers its own routes, owns its own table, and decides
-for itself who may reach either.
+An operator goes into a user's account from the admin, **without signing out
+of their own**, acts there as the user — sees what the user sees, changes what
+the user can change — and comes back with one click. Every visit has a
+deadline, and everything is recorded in
+[arandu-activitylog](https://github.com/hyz-is/arandu-activitylog) under the
+operator's name, with the account it was done in.
+
+It is the "inspecionar" of the operator consoles the team runs, made safe:
+who may inspect is a Policy, an operator's own account and another operator's
+are refused, nobody inspects from inside an account, and nothing done inside
+goes unlogged.
+
+## How it works
+
+- `POST /inspect/users/{id}` — the operator goes into the account. The session
+  is rotated to the account's owner with the operator kept as the one acting
+  (hesape `auth.ImpersonateActing`), so the very same browser is now inside the
+  account and every Grant writes as the owner would. The visit is recorded as
+  an inspection with a deadline (one hour by default), and as the entry
+  `inspection.started` in the `inspect` log.
+- Inside the account, every entry the application records names **the
+  operator** as its causer and carries the `impersonation` property — `by`,
+  `on_behalf_of`, `mode: acting` — which arandu-activitylog v0.3.0 adds by
+  itself.
+- `POST /inspect/leave` (route name `inspect.leave`) — the operator comes back:
+  the session is rotated to their own subject, the inspection is closed and
+  `inspection.left` is recorded.
+- `Guard()` — past the deadline, the next request inside the account takes the
+  operator back, closes the inspection and records `inspection.expired`.
+- `GET /inspect/history` — the inspections, newest first, for an operator.
+
+## The bar
+
+Every page built with `view.New` (hesape v0.57.0) knows it is drawn for an
+operator inside somebody's account and where the way back is. The
+application's layout draws the bar from `view.Inspection`:
+
+```go
+@if(inspecting(.))
+	<div class="..." role="status">
+		Você está na conta deste usuário como administrador.
+		<form method="post" action="{{ leaveLink(.) }}">@csrf<button>Voltar ao administrador</button></form>
+	</div>
+@endif
+```
+
+with, in the layout's `@go` block:
+
+```go
+func inspecting(d hview.Layout) bool {
+	i, ok := d.(hview.Inspection)
+	return ok && i.IsInspecting()
+}
+```
 
 ## Install
 
 ```bash
+go get github.com/hyz-is/arandu-activitylog@v0.3.0
 go get github.com/hyz-is/arandu-inspect
 ```
 
+It needs hesape v0.57.0 or newer.
+
 ## Wire it
 
-An Arandu application registers a module explicitly. There is no service
-provider, no container and no discovery, so these are the lines to paste into
-`bootstrap/app.go` and there are no others.
-
-The import, with the other module imports:
+In `bootstrap/app.go`, after the session store and the activity log exist:
 
 ```go
-import (
-	inspect "github.com/hyz-is/arandu-inspect"
-)
-```
-
-The construction, in `Build`, after the session store exists and before
-`k.Register`:
-
-```go
-	inspectModule, err := inspect.New(inspect.Config{}, db, sessions)
+	inspectModule, err := inspect.New(inspect.Config{
+		Targets:  inspect.TargetsFunc(users.InspectTarget), // the account as its owner signs in
+		Activity: activityModule.Logger(),
+		Landing:  "/painel",
+		Return:   "/admin/usuarios",
+	}, db, sessions)
 	if err != nil {
 		return App{}, err
 	}
 ```
 
-And the registration, inside the `k.Register(...)` call already there:
+register `inspectModule` in `k.Register(...)`, mount the guard after
+`RequireAuth` on the routes reachable from inside an account:
 
 ```go
-		inspectModule,
+	panel := r.Group("/painel", middleware.RequireAuth(sessions), inspectModule.Guard())
 ```
 
-Then, once, before the application serves:
+and run `aru migrate`. `Targets` answers the subject the account's owner signs
+in as — identifier, tenant, roles, actions — because the package keeps no
+users.
 
-```bash
-aru migrate
-```
+## Give people access
 
-This package owns a table, which is why the migration step is not optional and
-why `arandu.mod.toml` says `migrations = true`.
-
-## Publish the views
-
-This package carries the markup of its own pages and hands it over instead of
-rendering it from the inside, because a page you cannot edit is a page that says
-the wrong thing in your product.
-
-Look at what would be written, then write it:
-
-```bash
-aru vendor:publish --tag=view
-aru vendor:publish --tag=view --apply
-```
-
-Nothing is written without `--apply`. The preview lists every file as `create`,
-`update`, `unchanged` or `conflict`, and running the command a second time
-writes nothing. A file changed outside its `arandu:begin custom` markers is
-reported as a conflict and left alone; `--force` publishes over one, and even
-then what is inside the markers is carried forward.
-
-The files land under `resources/views/modules/inspect/`, and from that point
-they are yours. Nothing of this package is compiled beside them, so no view name
-is registered twice and no rule has to decide which of two files won — the
-consequence being that a view of this package that changes later does not reach
-a project that already published it.
-
-Two steps are left to you, and they are left to you because a command that
-edited `bootstrap/app.go` behind your back is a command whose output nobody can
-explain. Compile what was written:
-
-```bash
-aru view:build
-```
-
-and import the directory it wrote into, with the other imports:
-
-```go
-	_ "your/module/path/storage/framework/views/modules/inspect"
-```
-
-Without that import the views are not in the binary, and the module refuses to
-boot rather than answering the first request that reaches one of them with a
-500. The refusal names the view, the command and the import.
+`inspect.operator` is the role that goes into accounts and reads the history;
+the application gives it through
+[arandu-permission](https://github.com/hyz-is/arandu-permission). An account
+that carries the role is never inspected.
 
 ## Configuration
 
 | field | required | meaning |
 | --- | --- | --- |
+| `Targets` | yes | loads the account an operator goes into. |
+| `Activity` | yes | arandu-activitylog's logger. |
 | `Prefix` | no | where the routes are mounted. Defaults to `/inspect`. |
-| `PageSize` | no | how many records one page answers with. Defaults to 25, refused above 200. |
-
-The zero `Config{}` is a valid configuration. There is no tenant to set: every
-route needs a session, and the tenant of every statement is the one on the
-Grant of whoever is signed in.
-
-`New` returns an error rather than starting half-wired, so a setting that
-cannot work fails where it is written instead of on the first request that
-needed it.
-
-## Routes
-
-| method | path | name |
-| --- | --- | --- |
-| `GET` | `/inspect` | `inspect.index` |
-| `GET` | `/inspect/{id}` | `inspect.show` |
-| `POST` | `/inspect` | `inspect.store` |
-
-Every one of them sits behind `RequireAuth`: a visitor with no session is sent
-to `/auth/login`, and the handler of a request that has one reads who is asking
-with `ctx.User()`. Behind the guard, every route is refused until the policy is
-opened. That is the state the package ships in, and it is deliberate.
-
-A handler returns the error the service returned, and the router answers it: a
-policy refusal is 403, a record that is not there is 404, and a rejected input
-goes back where it came from with the messages in the flash. A request that asks
-for JSON gets the same statuses as `application/problem+json` documents, and a
-rejected input as a 422 with the messages keyed by field. No handler maps an
-error to a status itself.
-
-## Open the policy
-
-`policy.go` denies every action and has no branch that allows one. Open what
-this package needs, one action at a time, inside the custom block:
-
-```go
-	// arandu:begin custom
-	if a == InspectView && (s.ID == record.ID || s.HasRole("admin")) {
-		return nil
-	}
-	// arandu:end custom
-```
-
-What is not written there stays closed, including every action added later.
+| `Landing` | no | where the operator lands inside the account. Defaults to `/`. |
+| `Return` | no | where they land back in their own. Defaults to `/`. |
+| `TTL` | no | how long a visit lasts. Defaults to one hour; at most 12 hours. |
+| `UserType` | no | the kind the activity log names accounts by. Defaults to `user`. |
 
 ## The data path
 
-`Inspect` embeds `model.Model`, and `inspectTable`, beside it in `model.go`,
-declares its table once. `aru model:build` generates `InspectQuery.go` from
-it: `Inspects(db)`, which starts a `*InspectQuery`, and `InspectCollection`.
-The file is committed and never edited by hand; regenerate it after changing
-the entity, and `aru model:build --check` fails when it is out of date.
-
-`InspectService` owns `*data.DB` and follows
-`validate -> security.Authorize -> Grant -> Model terminal`; handlers never hold
-the database or start a query. Every query starts at `Inspects(s.db)`: the
-constructor returns one mutable query, so a second chain begun from a value held
-in a variable would carry the clauses of the first.
-
-Create builds the row with `Inspects(s.db).New()` and writes `TenantID` from
-`data.Tenant(g)`. Find authorizes before reading and again against the row it
-found. List authorizes before building its scoped, allowlisted query. The table
-keeps its default `tenant_id` scope on every terminal.
-
-Terminals return `*Inspect` and `[]*Inspect`. Keep those pointers: a copy of a
-row keeps the model of the original, and the model refuses to write through it
-with `model.ErrUnwired`. `Resource` and `Collection` are explicit response
-snapshots and do not expose tenant or Model internals.
-
-The rules of the entity itself — an invariant, a derived value, a transition
-such as `Rename` guarded by `CanRename` — go in the custom block of `model.go`,
-as pure methods: no database, no network, no clock read inside, no Grant. The
-service orchestrates: it validates, authorizes, calls those rules and saves
-with the Grant.
-
-There is no CRUD Repository. Add one only for a complex query, read model,
-report, export or raw SQL contract that the generated query cannot express.
-
-## Layout
-
-```
-module.go         registration, routes, handlers and migrations
-config.go         what the application passes in
-model.go          the entity, its table and its own rules, and what it may answer with
-InspectQuery.go  the query aru model:build generates from model.go
-policy.go         who may do what
-service.go        the use cases, and Model access after authorization
-views.go          the files the application takes ownership of
-```
-
-## What is already correct, and has to stay that way
-
-**The policy denies everything.** There is no permit-all branch to delete
-later. The Service calls `security.Authorize` before its first `Inspects(db)`
-reach, and every Model terminal requires the Grant that call produced.
-
-**Authorization precedes the Model.** The package audit checks that order in
-every exported Service method. A Model terminal enforces tenant scope; the
-preceding Policy call decides whether the action itself is allowed.
-
-**The tenant comes from `data.Tenant(g)`.** Never from the path, the body, the
-query string or a header. The value on the Grant came from the session; a value
-that arrived with the request is a value the caller chose.
-
-**Who is asking comes from the guard.** `RequireAuth` loads the session once and
-puts the subject on the request; nothing in the module loads it again.
-
-**`arandu.mod.toml` declares what the package does** — network, filesystem,
-exec, migrations — and the suite compares the declaration against what the code
-*calls*, not against what it imports: `net/http` is imported by everything with
-a route and says nothing. A package that says it makes no outbound calls and
-then opens one fails its own tests, and that is the only place the comparison
-happens. `aru doctor` audits the application it is run inside and never loads a
-dependency, so nothing audits an installed package except the package itself.
+`Inspection` embeds `model.Model` and declares its table beside it.
+`aru model:build` generates `InspectionQuery.go` with `Inspections(db)`,
+committed and never edited by hand; `aru model:build --check` fails when it is
+out of date. `InspectService` follows
+`validate -> security.Authorize -> Grant -> Model terminal` in every exported
+method, which the unit suite audits, and every route sits behind
+`RequireAuth`.
 
 ## Tests
 
 ```bash
-go test -race ./...
+GOWORK=off go test ./... -race
 ```
 
-The denial suite constructs the Service with a nil database, so even building
-`Inspects(nil)` would panic. The structural twin reads the allowed path and
-rejects any Service method that reaches the Model before `Authorize`, and any
-handler that loads the session or picks a status itself. The route tests drive
-the module with no session, with a signed-in subject and with a rejected input,
-on that same handle over no database.
+The feature suite runs the whole visit in one browser against SQLite: going
+in, acting as the owner, coming back, the deadline, and every refusal, with
+the activity log's entries checked; the rules were checked by mutation.
 
 ## Licence
 
-MIT. See [LICENSE.md](LICENSE.md). Copyright Paulo R. Lima.
+MIT. See [LICENSE.md](LICENSE.md).
