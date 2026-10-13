@@ -4,6 +4,12 @@
 
 # Arandu Inspect
 
+> **Renamed.** This package is now
+> [hyz-is/arandu-impersonate](https://github.com/hyz-is/arandu-impersonate),
+> which follows laravel-impersonate's names and adds `Protect()` and
+> `CanBeImpersonated`. This repository is archived; install the new one.
+
+
 An operator goes into a user's account from the admin, **without signing out
 of their own**, acts there as the user — sees what the user sees, changes what
 the user can change — and comes back with one click. Every visit has a

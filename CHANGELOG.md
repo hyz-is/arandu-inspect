@@ -10,6 +10,13 @@ a release is corrected by another release and never by moving a tag.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-13
+
+### Deprecated
+
+- The module is renamed to github.com/hyz-is/arandu-impersonate. `go.mod`
+  carries the deprecation, so `go get` and `go list -u` say so.
+
 ## [0.1.0] - 2026-10-13
 
 The first release: an operator inspects a user's account without signing out.

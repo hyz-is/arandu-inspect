@@ -1,3 +1,5 @@
+// Deprecated: renamed to github.com/hyz-is/arandu-impersonate, which follows
+// laravel-impersonate's vocabulary. Install that one.
 module github.com/hyz-is/arandu-inspect
 
 go 1.26.0

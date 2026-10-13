@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## v0.1.1
+
+Deprecated. Replace `github.com/hyz-is/arandu-inspect` with
+`github.com/hyz-is/arandu-impersonate` v0.1.0: the package `inspect` becomes
+`impersonate`, `Inspection` becomes `Impersonation`, `InspectStart` becomes
+`ImpersonateTake`, the role `inspect.operator` becomes
+`impersonate.impersonator`, `/inspect/users/{id}` becomes
+`/impersonate/take/{id}`, and `Landing`/`Return` become
+`TakeRedirectTo`/`LeaveRedirectTo`. The table is `impersonations`.
+
 ## v0.1.0
 
 The first release. Install arandu-activitylog v0.3.0 beside it (hesape v0.57.0
