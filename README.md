@@ -124,6 +124,18 @@ out of date. `InspectService` follows
 method, which the unit suite audits, and every route sits behind
 `RequireAuth`.
 
+## Example
+
+```bash
+go run -tags example ./example
+```
+
+It opens SQLite in a temporary directory, migrates arandu-activitylog and this
+package, and drives one browser: the operator goes into a user's account,
+changes a setting there, comes back, and the activity log is printed with every
+entry under the operator's name. It leaves nothing behind. The build tag is
+there so that installing this package never compiles it.
+
 ## Tests
 
 ```bash
